@@ -1,0 +1,491 @@
+---
+title: "Categorical Data Analysis Project: Predicting Commercial Success of Video Games Using Logistic Regression"
+author: "My Pham Ha Cao"
+date: "May 16th, 2026"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(fig.width = 10, fig.height = 5, echo = TRUE)
+library(knitr)
+```
+
+# 1. Introduction
+
+The video game industry has grown into one of the largest entertainment industries in the world, generating billions of dollars in annual revenue. However, not all games achieve commercial success. Some titles become global bestsellers while others perform poorly despite significant development costs and marketing efforts. Understanding the factors that contribute to a game’s success is therefore important for publishers, developers, and investors.
+
+This project analyzes factors associated with commercial success in video games using logistic regression. A binary classification model is developed to predict whether a game becomes a “hit” based on critic scores, genre, platform, and release year. Logistic regression is an appropriate modeling technique because the response variable is binary, representing whether a game achieved at least one million global sales.
+
+The objectives of this study are:
+
+* To identify significant predictors of commercial success in video games
+* To evaluate the effectiveness of logistic regression for classification
+* To interpret how game characteristics influence the probability of becoming commercially successful
+
+# 2. Data Set: Video Game Sales 2024
+
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(pROC)
+library(purrr)
+library(MASS)
+# Load data
+vg <- read.csv("D:/Video Game Sales 2024.csv", header = T)
+
+# Check column names
+names(vg)
+
+# Clean data and create target variable
+vg_clean <- vg %>%
+  mutate(
+    release_year = year(mdy(Released)),
+    hit = if_else(Global_Sales >= 1.0, 1L, 0L)
+  ) %>%
+  filter(
+    !is.na(Global_Sales),
+    !is.na(Critic_Score),
+    !is.na(Genre),
+    !is.na(Console),
+    !is.na(Publisher),
+    !is.na(Developer),
+    !is.na(release_year),
+    release_year >= 1980,
+    release_year <= 2024
+  )
+
+```
+```{r}
+# Function to group rare categories
+make_balanced_group <- function(x, y, min_hit = 20, min_nonhit = 20) {
+  x <- as.character(x)
+  y <- as.character(y)
+
+  tab <- table(x, y)
+
+  if (!"0" %in% colnames(tab)) {
+    tab <- cbind(tab, "0" = 0)
+  }
+
+  if (!"1" %in% colnames(tab)) {
+    tab <- cbind(tab, "1" = 0)
+  }
+
+  keep <- rownames(tab)[tab[, "0"] >= min_nonhit & tab[, "1"] >= min_hit]
+
+  ifelse(x %in% keep, x, "Other")
+}
+vg_model <- vg_clean %>%
+  mutate(
+    genre_group = factor(make_balanced_group(Genre, hit)),
+    console_group = factor(make_balanced_group(Console, hit)),
+    publisher_group = factor(make_balanced_group(Publisher, hit)),
+    developer_group = factor(make_balanced_group(Developer, hit)),
+    hit = factor(hit, levels = c(0, 1))
+  )
+
+vg_model <- vg_model[
+  ,
+  c(
+    "hit",
+    "Critic_Score",
+    "genre_group",
+    "console_group",
+    "publisher_group",
+    "developer_group",
+    "release_year"
+  )
+]
+```
+
+```{r}
+# Check class balance
+table(vg_model$hit)
+prop.table(table(vg_model$hit))
+
+#Split train/test data
+set.seed(123)
+
+train_index <- sample(
+  1:nrow(vg_model),
+  0.7 * nrow(vg_model)
+)
+
+train_data <- vg_model[train_index, ]
+test_data  <- vg_model[-train_index, ]
+```
+
+# 2. Fit a logistic regression model with all predictors
+
+```{r}
+# Fit logistic regression model
+mdl.full <- glm(
+  hit ~ Critic_Score +
+    genre_group +
+    console_group +
+    publisher_group +
+    developer_group +
+    release_year,
+  data = train_data,
+  family = binomial(link = "logit")
+)
+
+# Model summary
+summary(mdl.full)
+```
+The full model identifies fire year, species, diameter, CSV, neighbors within a 15 m distance, HEGYI, basal area of neighboring trees of the same species within a 15 m distance, and basal area of all neighboring trees within a 15 m distance as significant. The other non-significant predictors are removed.
+
+
+# 3. Select the best subset of variables. Perform a diagnostic on the best model.  Perform all possible inferences you can think about.
+
+```{r}
+# Likelihood Ratio Test for Variable Selection
+drop1(mdl.full, test="LRT")
+```
+Predictor selection was performed using single-term deletion likelihood ratio tests through the drop1() function in R. Each predictor was removed individually from the full logistic regression model and compared against the full model using likelihood ratio tests. Results indicated that all predictors significantly contributed to model fit, with all p-values below 0.001. Therefore, the full model was retained as the final logistic regression model.
+
+```{r}
+# Stepwise backward selection using AIC
+mdl.best <- stepAIC(
+  mdl.full,
+  direction = "both",
+  trace = TRUE
+)
+
+summary(mdl.best)
+```
+
+```{r}
+# Fit candidate logistic models 
+m1 <- glm(hit ~ Critic_Score + genre_group + release_year,
+          data = train_data, family = binomial(link = "logit"))
+
+m2 <- glm(hit ~ Critic_Score + genre_group + release_year + console_group,
+          data = train_data, family = binomial(link = "logit"))
+
+m3 <- glm(hit ~ Critic_Score + genre_group + release_year + console_group + publisher_group,
+          data = train_data, family = binomial(link = "logit"))
+
+models <- list(
+  "Model 1: score + year + genre" = m1,
+  "Model 2: add console" = m2,
+  "Model 3: add publisher" = m3
+)
+
+model_selection <- map_dfr(names(models), function(nm) {
+  mod <- models[[nm]]
+
+  p <- predict(
+    mod,
+    newdata = test_data,
+    type = "response"
+  )
+
+  roc_obj <- roc(
+    response = test_data$hit,
+    predictor = p,
+    levels = c("0", "1"),
+    quiet = TRUE
+  )
+
+  tibble(
+    model = nm,
+    parameters = length(coef(mod)),
+    AIC = AIC(mod),
+    validation_AUC = as.numeric(auc(roc_obj))
+  )
+})
+
+
+print(model_selection)
+
+# Choose final model: lowest AIC and highest validation AUC
+final_model <- m3
+test_data$prob_hit <- predict(final_model, newdata = test_data, type = "response")
+
+```
+
+
+```{r}
+# Null model
+mdl.null = glm(hit~1, family=binomial(), data=train_data)
+# Compare null model vs best model
+anova(mdl.best, mdl.null, test="LRT")
+AIC(mdl.null, mdl.best)
+```
+The final logistic regression model was compared against the null model using a likelihood ratio test. The null model contained only an intercept term and no predictors.
+
+Results indicated that the final model significantly improved model fit compared to the null model (p<0.001). Additionally, the final model produced substantially lower deviance and AIC values, demonstrating improved explanatory power.
+
+These results indicate that critic score, genre, console, publisher, developer, and release year collectively contribute significantly to predicting whether a video game becomes commercially successful.
+```{r}
+residuals=data.frame(rstandard(mdl.best,type="pearson"), residuals(mdl.best, type="pearson"),
+                residuals(mdl.best,type="deviance"), rstandard(mdl.best,type="deviance"))
+names(residuals)=cbind("standardized", "Pearson", "deviance", "std. dev")
+boxplot(residuals,  ylim = c(-5, 5))
+```
+The model fit can be examined using the residuals, where the majority of the data is falling in a range with standard residuals less than 2
+
+```{r}
+
+coef_table <- data.frame(
+  Variable = names(coef(mdl.best)),
+  Estimate = coef(mdl.best),
+  Odds_Ratio = exp(coef(mdl.best)),
+  row.names = NULL
+)
+
+ci_beta <- suppressMessages(confint(mdl.best))
+ci_or <- exp(ci_beta)
+
+inference_table <- data.frame(
+  Variable = names(coef(mdl.best)),
+  Estimate = coef(mdl.best),
+  Odds_Ratio = exp(coef(mdl.best)),
+  Lower_95_CI = ci_or[, 1],
+  Upper_95_CI = ci_or[, 2],
+  row.names = NULL
+)
+
+coef_table
+inference_table
+```
+
+# 4. Use the new model to make predictions.
+
+```{r}
+# Predicted Probabilities
+pred.prob <- predict(
+  mdl.best,
+  newdata = test_data,
+  type = "response"
+)
+```
+
+
+# 5. Use different pi_0 as a cut-off point and create a confusion table.
+```{r}
+cutoffs <- c(0.25, 0.40, 0.50, 0.60, 0.75, 0.85, 0.90)
+
+cutoff_results <- data.frame(
+  cutoff = cutoffs,
+  accuracy = NA,
+  sensitivity = NA,
+  specificity = NA
+)
+
+for (i in seq_along(cutoffs)) {
+
+  pred_class <- ifelse(pred.prob >= cutoffs[i], 1, 0)
+
+  cm <- table(
+    Predicted = factor(pred_class, levels = c(0, 1)),
+    Actual = factor(test_data$hit, levels = c(0, 1))
+  )
+
+  print(paste("Cutoff =", cutoffs[i]))
+  print(cm)
+
+  TN <- cm["0", "0"]
+  FP <- cm["1", "0"]
+  FN <- cm["0", "1"]
+  TP <- cm["1", "1"]
+
+  cutoff_results$accuracy[i] <- (TP + TN) / sum(cm)
+  cutoff_results$sensitivity[i] <- TP / (TP + FN)
+  cutoff_results$specificity[i] <- TN / (TN + FP)
+}
+
+cutoff_results
+```
+
+
+# 6. Perform visualization of data and models.  
+```{r}
+library(ggplot2)
+ggplot(vg_model, aes(x = Critic_Score, fill = hit)) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 30) +
+  labs(
+    title = "Distribution of Critic Score by Hit Status",
+    x = "Critic Score",
+    y = "Count"
+  )
+
+plot_data <- data.frame(
+  Critic_Score = test_data$Critic_Score,
+  Predicted_Probability = pred.prob
+)
+
+ggplot(plot_data, aes(x = Critic_Score, y = Predicted_Probability)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "loess") +
+  labs(
+    title = "Predicted Probability of Hit by Critic Score",
+    x = "Critic Score",
+    y = "Predicted Probability"
+  )
+
+genre_plot <- vg_model %>%
+  group_by(genre_group) %>%
+  summarise(
+    hit_rate = mean(as.numeric(as.character(hit))),
+    n = n(),
+    .groups = "drop"
+  )
+
+ggplot(genre_plot, aes(x = reorder(genre_group, hit_rate), y = hit_rate)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Hit Rate by Genre",
+    x = "Genre",
+    y = "Hit Rate"
+  )
+
+console_plot <- vg_model %>%
+  group_by(console_group) %>%
+  summarise(
+    hit_rate = mean(as.numeric(as.character(hit))),
+    n = n(),
+    .groups = "drop"
+  )
+
+ggplot(console_plot, aes(x = reorder(console_group, hit_rate), y = hit_rate)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Hit Rate by Console",
+    x = "Console",
+    y = "Hit Rate"
+  )
+```
+
+
+# 7. Plot the ROC curve, find AUC, and the best cutoff point for classification.
+
+the AUC is 0.8756 with the best cutoff point of $\pi_0=0.1111$
+
+```{r}
+roc.obj <- roc(
+  response = test_data$hit,
+  predictor = pred.prob,
+  levels = c("0", "1")
+)
+
+auc(roc.obj)
+
+plot(
+  roc.obj,
+  main = "ROC Curve for Best Logistic Regression Model"
+)
+```
+
+```{r}
+best_cutoff <- coords(
+  roc.obj,
+  x = "best",
+  best.method = "youden",
+  ret = c("threshold", "sensitivity", "specificity")
+)
+
+best_cutoff
+```
+
+# 8. Perform LOOCV and k-fold cross-validation.
+
+```{r}
+# k-fold K=10
+library(lattice)
+library(DAAG)
+cv.binary(mdl.best)
+```
+
+# 9. Try the probit link and the identity links to model data. 
+
+```{r}
+# probit
+mdl.probit <- glm(
+  hit ~ Critic_Score +
+    genre_group +
+    console_group +
+    publisher_group +
+    developer_group +
+    release_year,
+  family = binomial(link = "probit"),
+  data = train_data
+)
+summary(mdl.probit)
+
+preds = predict(mdl.probit, newdata=test_data, type="response")
+prop = 0.912
+yy <- test_data$hit
+yhat <- as.numeric(preds >prop)
+confusion <- table(yy, yhat)
+confusion
+
+
+confusion[1,1]/(confusion[1,1]+confusion[1,2])
+confusion[2,2]/(confusion[2,1]+confusion[2,2])
+(confusion[1,1]+confusion[2,2])/(confusion[1,1]+confusion[1,2]+confusion[2,1]+confusion[2,2])
+```
+
+```{r}
+# identity
+mdl.identity <- try(
+  glm(
+    hit ~ Critic_Score +
+      genre_group +
+      console_group +
+      publisher_group +
+      developer_group +
+      release_year,
+
+    family = binomial(link = "identity"),
+    data = train_data
+  ),
+  silent = TRUE
+)
+if (inherits(mdl.identity, "try-error")) {
+
+  print("Identity link model failed to converge.")
+
+} else {
+
+  summary(mdl.identity)
+
+  preds <- predict(
+    mdl.identity,
+    newdata = test_data,
+    type = "response"
+  )
+
+  prop <- 0.5
+
+  yy <- as.numeric(as.character(test_data$hit))
+
+  yhat <- as.numeric(preds > prop)
+
+  confusion <- table(yy, yhat)
+
+  confusion
+
+}
+
+```
+```
+
+
+# 10. Which model works better for this data?
+
+The probit model performs the best for this data, with specificity, sensitivity, and accuracy slightly higher on the validation set than the logistic link model. The identity model fails to find the correct starting values.
+
+# 11. If you have grouped data, use the methods for contingency tables to analyze the data (Chi sq test, G^2, and so on if applicable).
+
+Data is ungrouped - not applicable
+
+# 12. Write a report
+
+See accompanying document.
